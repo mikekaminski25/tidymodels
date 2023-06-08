@@ -1,0 +1,178 @@
+---
+title: "K-means clustering with tidy data principles"
+author: "Mike Kaminski"
+date: "2023-06-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Objective: summarize clustering characteristics and estimate the number of clusters
+
+# Introduction:
+- use tidy, augment, and glance
+
+```{r}
+# random data with three clusters.  Each will come from a multivariate gaussian distribution with differnet means for each cluster
+
+library(tidymodels)
+
+set.seed(525)
+
+centers <- tibble(
+  cluster = factor(1:3),
+  num_points = c(100, 150, 50),
+  x1 = c(5 ,0, -3),
+  x2 = c(-1, 1, -2)
+)
+
+labelled_points <-
+  centers %>%
+  mutate(
+    x1 = map2(num_points, x1, rnorm),
+    x2 = map2(num_points, x2, rnorm)
+  ) %>%
+  select(-num_points) %>%
+  unnest(cols = c(x1, x2))
+
+ggplot(labelled_points, aes(x1, x2, color = cluster)) +
+  geom_point(alpha = 0.3)
+
+```
+# How does K-Means work?
+- specify the number of clusters
+- centroids are randomly placed
+- each observation gets assigned to the nearest centroid based on Euclidean distance.
+- then the centroid is recalculated based on the clusters
+- then each point is reassigned to the nearest cluster
+- then the centroid is recalculated based on the clusters
+- then each point is reassigned to the nearest cluster
+-.....
+- iterative process until no changes.
+
+```{r}
+points <-
+  labelled_points %>%
+  select(-cluster)
+
+kclust <- kmeans(points, center = 3)
+kclust
+
+summary(kclust)
+
+```
+This gives us a list of vectors
+- cluster 300 values, which is the data about each point.
+- centers, withinss, and size contrain info about each cluster
+-- centers includes cluster means at x1 and x2 for each cluster
+- totss, tot.withinss, betweenss, and iter contain info about the full clustering
+
+```{r}
+# this gives us each point of data
+augment(kclust, points)
+```
+
+```{r}
+#thi gives us a per-cluster level
+tidy(kclust)
+
+```
+
+```{r}
+# this gives us a single row summary
+glance(kclust)
+
+```
+# Exploratory Clustering
+We want to combine this power with dplyr
+We can explore different choices of k, from 1 to 9.
+- We cluster 9 times, with each having a different value of k.  Then we create columns containing the tidied, glanced, and augmented data
+```{r}
+kclusts <-
+  tibble(k = 1:9) %>%
+  mutate(kclust = map(k, ~kmeans(points, .x)),
+         tidied = map(kclust, tidy),
+         glanced = map(kclust, glance),
+         augmented = map(kclust, augment, points)
+         )
+kclusts
+
+```
+
+Now we can turn into 3 seprate datasets for tidy, augment, and glance
+```{r}
+clusters <- 
+  kclusts %>%
+  unnest(cols = c(tidied))
+
+assignments <- 
+  kclusts %>% 
+  unnest(cols = c(augmented))
+
+clusterings <- 
+  kclusts %>%
+  unnest(cols = c(glanced))
+
+
+```
+
+And we plot
+```{r}
+p1 <-
+  ggplot(assignments, aes(x = x1, y = x2)) +
+  geom_point(aes(color = .cluster), alpha = 0.8) +
+  facet_wrap(~k)
+p1
+
+
+```
+
+It's pretty clear that 3 is the optimal number of clusters.  We can add an X to the center of each cluster
+```{r}
+p2 <- p1 + geom_point(data = clusters, size = 10, shape = "x")
+p2
+
+```
+
+The data from glance fills a bit of a different purpose.  We want to look at total within sum of squares.
+- This represents the variance within the clusters.  We want to look for the elbow bend.
+```{r}
+ggplot(clusterings, aes(k, tot.withinss)) +
+  geom_line() +
+  geom_point()
+
+```
+```{r}
+sessionInfo()
+
+
+```
+attached base packages:
+[1] stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+ [1] yardstick_1.1.0    workflowsets_1.0.0 workflows_1.1.2    tune_1.0.1         tidyr_1.2.1       
+ [6] tibble_3.1.8       rsample_1.1.0      recipes_1.0.3      purrr_0.3.5        parsnip_1.0.3     
+[11] modeldata_1.0.1    infer_1.0.4        ggplot2_3.4.1      dplyr_1.0.10       dials_1.1.0       
+[16] scales_1.2.1       broom_1.0.1        tidymodels_1.0.0  
+
+loaded via a namespace (and not attached):
+ [1] pkgload_1.3.2       viridisLite_0.4.1   splines_4.2.2       foreach_1.5.2      
+ [5] prodlim_2019.11.13  assertthat_0.2.1    GPfit_1.0-8         yaml_2.3.6         
+ [9] globals_0.16.2      ipred_0.9-13        pillar_1.8.1        backports_1.4.1    
+[13] lattice_0.20-45     glue_1.6.2          digest_0.6.30       hardhat_1.2.0      
+[17] colorspace_2.0-3    htmltools_0.5.5     Matrix_1.5-1        timeDate_4021.106  
+[21] pkgconfig_2.0.3     lhs_1.1.5           DiceDesign_1.9      listenv_0.8.0      
+[25] gower_1.0.0         lava_1.7.0          timechange_0.1.1    farver_2.1.1       
+[29] generics_0.1.3      ellipsis_0.3.2      withr_2.5.0         furrr_0.3.1        
+[33] nnet_7.3-18         cli_3.6.0           survival_3.4-0      magrittr_2.0.3     
+[37] evaluate_0.18       future_1.29.0       fansi_1.0.3         parallelly_1.32.1  
+[41] MASS_7.3-58.1       class_7.3-20        tools_4.2.2         lifecycle_1.0.3    
+[45] munsell_0.5.0       compiler_4.2.2      rlang_1.0.6         grid_4.2.2         
+[49] iterators_1.0.14    rstudioapi_0.14     labeling_0.4.2      rmarkdown_2.18     
+[53] gtable_0.3.1        codetools_0.2-18    DBI_1.1.3           R6_2.5.1           
+[57] lubridate_1.9.0     knitr_1.41          fastmap_1.1.0       future.apply_1.10.0
+[61] utf8_1.2.2          parallel_4.2.2      Rcpp_1.0.9          vctrs_0.5.1        
+[65] rpart_4.1.19        tidyselect_1.2.0    xfun_0.35   
