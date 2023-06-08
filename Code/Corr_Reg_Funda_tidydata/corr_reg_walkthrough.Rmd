@@ -1,0 +1,188 @@
+---
+title: "Correlation and regression fundamentals with tidy data principles"
+author: "Mike Kaminski"
+date: "2023-06-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Objective: Analyze the results of correlation tests and simple regression models for many data sets at once
+
+# Intro:
+The broom package in tidymodels is useful for a single analysis, however it's not useful for combining multiple analyses.
+- subgroups of data, analyses using diff models, bootstraps, permutations, etc.
+
+
+# Correlation Analysis:
+Note: we coerce into a tibble so that we get a nicer print output
+```{r}
+library(tidymodels)
+
+data(Orange)
+Orange <- as_tibble(Orange)
+Orange
+
+```
+Tree, age, and circumference are the variables.  Tree describes 5 types of trees
+
+```{r}
+cor(Orange$age, Orange$circumference)
+
+library(ggplot2)
+
+ggplot(Orange, aes(age, circumference, color = Tree)) +
+  geom_line()
+
+```
+
+We can test the correltaion within each tree
+```{r}
+Orange %>%
+  group_by(Tree) %>%
+  summarize(correlation = cor(age, circumference))
+
+```
+
+Now let's say we want to perform a hypothesis test instead of simply estimating the correlation
+```{r}
+ct <- cor.test(Orange$age, Orange$circumference)
+ct
+
+tidy(ct)
+```
+Usually we want to perform multiple tests or fit multiple models on different parts of the data.  Here we can use a nest-map-unnest workflow.
+
+We want to perform correlation tests for each different tree
+```{r}
+# start by nesting
+nested <-
+  Orange %>%
+  nest(data = c(age, circumference))
+
+# then we do a correlation test for each tibble using purrr::map()
+nested %>%
+  mutate(test = map(data, ~ cor.test(.x$age, .x$circumference)))
+
+# tidy each of the objects
+nested %>%
+  mutate(test = map(data, ~ cor.test(.x$age, .x$circumference)), # S# list-col
+         tidied = map(test, tidy)
+         )
+
+# then we want to unnest the tidied dataframe so that the results are a flat tibble.
+
+Orange %>% 
+  nest(data = c(age, circumference)) %>% 
+  mutate(
+    test = map(data, ~ cor.test(.x$age, .x$circumference)), # S3 list-col
+    tidied = map(test, tidy)
+  ) %>% 
+  unnest(cols = tidied) %>% 
+  select(-data, -test)
+```
+
+# Regression Models
+This type of workflow is more useful when applied to regressions
+
+```{r}
+
+options(scipen = 10, digits =4)
+lm_fit <- lm(age ~ circumference, data = Orange)
+summary(lm_fit)
+tidy(lm_fit)
+```
+
+We can do multiple regressions at once using the same workflow
+```{r}
+Orange %>%
+  nest(data = c(-Tree)) %>%
+  mutate(
+    fit = map(data, ~ lm(age ~ circumference, data = .x)),
+    tidied = map(fit, tidy)
+  ) %>%
+  unnest(tidied) %>%
+  select(-data, -fit)
+  
+
+
+```
+
+We can also use multiple predictors in the regressions.  We nest the data into automatic vs manual and then do regression
+```{r}
+data(mtcars)
+mtcars <- as_tibble(mtcars)
+mtcars
+
+mtcars %>%
+  nest(data = c(-am)) %>%
+  mutate(
+    fit = map(data, ~ lm(wt ~ mpg + qsec + gear, data = .x)),  # S3 list-col
+    tidied = map(fit, tidy)
+  ) %>%
+  unnest(tidied) %>%
+  select(-data, -fit)
+
+```
+
+
+We can have the tidy(), as well as the aug,ent() and glance()
+```{r}
+regressions <- 
+  mtcars %>%
+    nest(data = c(-am)) %>%
+    mutate(
+      fit = map(data, ~ lm(wt ~ mpg + qsec + gear, data = .x)),  # S3 list-col
+      tidied = map(fit, tidy),
+      glanced = map(fit, glance),
+      augmented = map(fit, augment)
+    )
+
+regressions %>%
+  select(tidied) %>%
+  unnest(tidied)
+
+regressions %>%
+  select(glanced) %>%
+  unnest(glanced)
+
+
+regressions %>%
+  select(augmented) %>%
+  unnest(augmented)
+
+```
+
+When we combine the estimates and p-values across all groups into the same tidy dataframe - instead of a list of output model objects - class analyses and visualizations become more straighforward
+- we can ort p-values or estimate to find the most significant terms across all tests
+- we can make p-value histograms
+- we can make volcano plots comparing p-values to effect size estimates.
+
+We can easily filter, facet, or distinguish based on the 'term' column
+
+```{r}
+sessionInfo()
+
+
+```
+attached base packages:
+[1] stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+ [1] yardstick_1.1.0    workflowsets_1.0.0 workflows_1.1.2    tune_1.0.1         tidyr_1.2.1        tibble_3.1.8       rsample_1.1.0     
+ [8] recipes_1.0.3      purrr_0.3.5        parsnip_1.0.3      modeldata_1.0.1    infer_1.0.4        ggplot2_3.4.1      dplyr_1.0.10      
+[15] dials_1.1.0        scales_1.2.1       broom_1.0.1        tidymodels_1.0.0  
+
+loaded via a namespace (and not attached):
+ [1] pkgload_1.3.2       viridisLite_0.4.1   splines_4.2.2       foreach_1.5.2       prodlim_2019.11.13  assertthat_0.2.1    GPfit_1.0-8        
+ [8] yaml_2.3.6          globals_0.16.2      ipred_0.9-13        pillar_1.8.1        backports_1.4.1     lattice_0.20-45     glue_1.6.2         
+[15] digest_0.6.30       hardhat_1.2.0       colorspace_2.0-3    htmltools_0.5.5     Matrix_1.5-1        timeDate_4021.106   pkgconfig_2.0.3    
+[22] lhs_1.1.5           DiceDesign_1.9      listenv_0.8.0       gower_1.0.0         lava_1.7.0          timechange_0.1.1    farver_2.1.1       
+[29] generics_0.1.3      ellipsis_0.3.2      withr_2.5.0         furrr_0.3.1         nnet_7.3-18         cli_3.6.0           survival_3.4-0     
+[36] magrittr_2.0.3      evaluate_0.18       future_1.29.0       fansi_1.0.3         parallelly_1.32.1   MASS_7.3-58.1       class_7.3-20       
+[43] tools_4.2.2         lifecycle_1.0.3     munsell_0.5.0       compiler_4.2.2      rlang_1.0.6         grid_4.2.2          iterators_1.0.14   
+[50] rstudioapi_0.14     labeling_0.4.2      rmarkdown_2.18      gtable_0.3.1        codetools_0.2-18    DBI_1.1.3           R6_2.5.1           
+[57] lubridate_1.9.0     knitr_1.41          fastmap_1.1.0       future.apply_1.10.0 utf8_1.2.2          parallel_4.2.2      Rcpp_1.0.9         
+[64] vctrs_0.5.1         rpart_4.1.19        tidyselect_1.2.0    xfun_0.35  
