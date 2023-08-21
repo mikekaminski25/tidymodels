@@ -1,0 +1,178 @@
+---
+title: "Build A Model"
+author: "Mike Kaminski"
+date: "2023-08-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, warning = FALSE,
+                      message = FALSE, dpi = 180,
+                      fig.width = 10, fig.height = 5)
+```
+
+```{r}
+library(tidymodels) # broom, dials, dplyr, ggplot2, infer, parsnip, purrr, recipes, rsample, tibble, tune, workflows, yardstick
+
+# Helper packages
+library(readr)       # for importing data
+library(broom.mixed) # for converting bayesian models to tidy tibbles
+library(dotwhisker)  # for visualizing regression results
+```
+
+# Intro
+This markdown file will go through the steps needed to build a model - based on https://www.tidymodels.org/start/models/.
+
+## Sea Urchins Data
+The aim is to explore how different feeding regimes impact the size of sea urchins over time.
+```{r data, show_col_types = FALSE}
+urchins <-
+  read_csv("https://tidymodels.org/start/models/urchins.csv") %>% 
+  
+  # Change the names to something a bit more understandable
+  setNames(c("food_regime", "initial_volume", "width")) %>%
+  
+  # Update food_regime to a factor
+  mutate(food_regime = factor(food_regime, levels = c("Initial", "Low", "High")))
+```
+
+The data is a tibble.  These are essentially data frames, but there are some tweaks to make life a little easier.  They're a modern take on data frames, keeping features that have stood the test of time and dropping features that are no longer useful.  They're one of the underlying features of the tidyverse.  Many other R packages use regular data frames, so using as_tibble() will coerce data frames into tibbles.  Tibbles never convert strings to factors, they don't change the names of variables and it never creates new row names.
+
+The two main differences are printing and subsetting.  Tibbles have a refined print method that only shows the first 10 rows and all the columns that fit on the screen - which make it easier to work with large data.  
+  * print(n = 10, width = Inf) will display all columns.
+  * options(tibble.print_max = n, tibble.print_min = m) are useful for showing more rows
+  * options(tibble.width = Inf) will show all columns <br/>
+
+$ and [[ are used to extract by name or position. df %>% .$x uses the "." placeholder to extract the data
+
+## Plotting
+The below plots initial_volume against width, grouped and colored by food_regime.  Sea urchins with a larger initial volume tend to have a larger width.  The slopes of the lines are different, so this effect may depend on the feeding regime.
+```{r}
+ggplot(urchins,
+       aes(x = initial_volume, 
+           y = width, 
+           group = food_regime, 
+           col = food_regime)) + 
+  geom_point() + 
+  geom_smooth(method = lm, se = FALSE) +
+  scale_color_viridis_d(option = "plasma", end = .7)
+```
+
+## Modeling
+Since we have a continuous and categorical predictor, a standard two-way analysis of variance (ANOVA) model works for this data. Ordinary least squares regressions is a good approach.  From the parsnip package, the functional form of the model needs to be selected.  In this case - linear regressions.  The default engine with linear_reg is lm(), but others can be selected - glm, keras, etc.
+```{r}
+lm_mod <- linear_reg()
+```
+
+```{r}
+lm_fit <-
+  lm_mod %>%
+  fit(width ~ initial_volume * food_regime, data = urchins)
+lm_fit
+```
+Summary information for the model can be populated using summary(), however tidy() provides the results in a more predictable and useful format.  The output can be used to generate a dot-whisker plot.  The coeffiecents ares plotted on the x-axis.
+```{r}
+tidy(lm_fit)
+```
+
+```{r}
+tidy(lm_fit) %>%
+  dwplot(dot_args = list(size = 2, color = "black"),
+         whisker_args = list(color = "black"),
+         vline = geom_vline(xintercept = 0, colour = "grey50", linetype = 2))
+
+```
+
+## Predicting
+The fitted object lm_fit has an lm model built inside of it - lm_fit$fit
+
+Suppose that we want to plot the mean body size for sea urchins that started with an initial volume of 20ml.  To get the results, the predict function can be used.  We can also get the confidence interval, combine the data, and plot.
+```{r}
+new_points <- expand.grid(initial_volume =20,
+                          food_regime = c("Initial","High", "Low"))
+new_points
+```
+
+```{r}
+mean_pred <- predict(lm_fit, new_data = new_points)
+mean_pred
+```
+
+```{r}
+conf_int_pred <- predict(lm_fit, 
+                         new_data = new_points, 
+                         type = "conf_int")
+conf_int_pred
+
+# combine: 
+plot_data <- 
+  new_points %>% 
+  bind_cols(mean_pred) %>% 
+  bind_cols(conf_int_pred)
+
+#  plot:
+ggplot(plot_data, aes(x = food_regime)) + 
+  geom_point(aes(y = .pred)) + 
+  geom_errorbar(aes(ymin = .pred_lower, 
+                    ymax = .pred_upper),
+                width = .2) + 
+  labs(y = "urchin size")
+```
+
+## Modeling with a different engine
+Suppose that a Bayesian approach needs to be taken.  For this, a prior distribution needs to be declared for each model parameter that represents the possible values of the parameters 0 before being exposed to the data.  The priors need to be bell-shaped, but the range is unknown. The priors will be made wide using a Cauchy distribution - which is the same a t-dist with a single degree of freedom.
+
+Bayesian:
+ * starts with an initial belief
+ * then new evidence is gathered.  This evidence is used to calculate the likelihood
+ * combine new evidence with the prior to get an updated likelihood
+ * The result is called the posterior
+ 
+ Cauchy Dist:
+ -  a distribution with wider tails - they decrease more slowly than Gaussian/normal - and have no mean or variance.
+
+The engine needed for the model is stan instead of lm
+* a prior dist is created - it needs to be used in the arguements for set_engine()
+* model is created and trained
+* this type of model involves randomly generated numbers in the fitting process
+```{r}
+# prior distribution
+prior_dist <- rstanarm::student_t(df = 1)
+set.seed(123)
+
+# make the parsnip model
+bayes_mod <-   
+  linear_reg() %>% 
+  set_engine("stan", 
+             prior_intercept = prior_dist, 
+             prior = prior_dist) 
+
+# train the model
+bayes_fit <- 
+  bayes_mod %>% 
+  fit(width ~ initial_volume * food_regime, data = urchins)
+
+print(bayes_fit, digits = 5)
+```
+A tidier version of the model
+```{r}
+tidy(bayes_fit, conf.int = TRUE)
+
+
+```
+
+Combine new points (each has a value of 20), bind with predictions and confidence interval
+```{r}
+bayes_plot_data <- 
+  new_points %>% 
+  bind_cols(predict(bayes_fit, new_data = new_points)) %>% 
+  bind_cols(predict(bayes_fit, new_data = new_points, type = "conf_int"))
+
+ggplot(bayes_plot_data, aes(x = food_regime)) + 
+  geom_point(aes(y = .pred)) + 
+  geom_errorbar(aes(ymin = .pred_lower, ymax = .pred_upper), width = .2) + 
+  labs(y = "urchin size") + 
+  ggtitle("Bayesian model with t(1) prior distribution")
+```
+
+The results aren't much different than the non-Bayesian method - except in interpretation
