@@ -21,7 +21,7 @@ Previously we learned how to specify and train models using different engines fr
 ## Flights Data
 The goal is to predict if a flight is going to be more than 30 mins late
 ```{r}
-library(tidymodels)      # for the recipes package, along with the rest of tidymodels
+library(tidymodels) # broom, dials, dplyr, ggplot2, infer, parsnip, purrr, recipes, rsample, tibble, tune, workflows, yardstick
 
 # Helper packages
 library(nycflights13)    # for flight data - variable named "flights", "weather",
