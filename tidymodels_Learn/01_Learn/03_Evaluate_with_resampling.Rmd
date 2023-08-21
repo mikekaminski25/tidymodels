@@ -1,0 +1,145 @@
+---
+title: "Evaluate your model with resampling"
+author: "Mike Kaminski"
+date: "2023-08-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, warning = FALSE,
+                      message = FALSE, dpi = 180,
+                      fig.width = 10, fig.height = 5)
+```
+
+# Intro
+So far we've built a model and preprocessed the data with a recipe.  We've used workflows to bundle the model with the recipe as well.  This part will cover various resampling techniques to better characterize model performance.
+```{r}
+library(tidymodels) # broom, dials, dplyr, ggplot2, infer, parsnip, purrr, recipes, rsample, tibble, tune, workflows, yardstick
+
+# Helper packages
+library(modeldata)  # for the cells data
+```
+
+# Data
+```{r}
+data(cells, package = "modeldata")
+cells
+```
+## Background
+When conducting experiments biologists will treat cells with either a drug or a control and observe to see the effects.  Cell imaging is often used for this kind of measurement.  Different parts of the cells are colored so that the location of the cell can be determined. Ex.  Green could be the boundary while blue could be the nucleus.
+
+The cells in an image can be segmented so that we know which pixels belong to which cell.  Sometimes the segmentation doesn't work particularly well.  This leads to contamination and could lead the biologist to inaccurate conclusions about the data.  Cells are tiny, so an experiment could involve millions of cells.  It makes no sense to visually assess them all.  What's been done with this data is that a subsample has been taken and manually labelled as poorly segmented or well-segmented.  If we can predict these labels accurately, then the larger data set can be improved by filtering out poorly segmented cells
+
+The variable avg_inten_ch_1 is the mean intensity of the data in the nucleus. area_ch_1  is the total size of the cell.  The proporition of WS vs PS is a bit imbalanced.
+```{r}
+cells %>% 
+  count(class) %>% 
+  mutate(prop = n/sum(n))
+```
+
+# Data Splitting
+Within the initial_split function, there is an argument called strata - which does a stratified split of the data.  This creates a train and test set with the same proportion of PS and WS
+```{r}
+set.seed(123)
+cell_split <- initial_split(cells %>% select(-case), 
+                            strata = class)
+```
+
+Both train and test have about 65% PS and 35% WS
+```{r}
+cell_train <- training(cell_split)
+cell_test  <- testing(cell_split)
+
+nrow(cell_train)
+nrow(cell_train)/nrow(cells)
+
+# training set proportions by class
+cell_train %>% 
+  count(class) %>% 
+  mutate(prop = n/sum(n))
+
+
+# test set proportions by class
+cell_test %>% 
+  count(class) %>% 
+  mutate(prop = n/sum(n))
+
+```
+
+# Modeling
+For this example, we'll use random forest as the model.  Random forests are ensembles of decision trees.  A large number of decision trees are created for the ensemble based on slightly different versions of the training set.  A different set of variables are used when creating the decision trees, so the most important variables will likely be omitted from some of the trees.  This creates different cuts within the tree and different variables will be at the top.  Random forests are very low maintenance and require very little preprocessing, which is great!  Additionally, the default parameters tend to provide reasonable results, so not a lot of tuning. Since this is fairly straight forward, we don't need a recipe.
+
+The ranger engine in parsnip is what we need to use for random forest.  RFs can be done for regressions models as well, so we need to set the mode as classification.
+```{r}
+rf_mod <- 
+  rand_forest(trees = 2500) %>% 
+  set_engine("ranger") %>% 
+  set_mode("classification")
+```
+
+The fit function can be used with the model formula from above.  Since RF models use random numbers, we need to set a seed.  The rf_fit object is our fitted model, which has been trained on the training data.
+```{r}
+set.seed(234)
+rf_fit <- 
+  rf_mod %>% 
+  fit(class ~ ., data = cell_train)
+rf_fit
+```
+
+# Estimating Performance
+For this example, we'll use the area under the ROC curve and overall classification accuracy to asses model performance.  If we have multiple models, we can compare these stats across all the models to see which one performs best.
+
+The ROC curve uses class probabilities to give us a sense of performance across the entire set of potential probability cutoffs.  Overall accuracy uses the hard class predictions to measure performance - either WS or PS for each.  For now, we'll use a 50% probability cutoff to categrozie a cell as poorly segmented.
+```{r}
+rf_testing_pred <- 
+  predict(rf_fit, cell_test) %>% 
+  bind_cols(predict(rf_fit, cell_test, type = "prob")) %>% 
+  bind_cols(cell_test %>% select(class))
+```
+
+The below gives us the roc_auc and the accuracy.
+```{r}
+rf_testing_pred %>%                   # test set predictions
+  roc_auc(truth = class, .pred_PS)
+
+rf_testing_pred %>%                   # test set predictions
+  accuracy(truth = class, .pred_class)
+
+```
+
+# Resampling
+Cross-validation and bootstrapping are two common approaches to resampling.  Each creates data sets similar to the training/test split from before - one subset is used for creating the model and a different subset is used for evaluating performance.
+  * The data is split into train and test
+  * The training set is choosen for resampling, while the test is held out.
+  * If we use 10-fold, then 10 groups of roughly equal size folds are created.
+  * Each of the folds holds out 10% of the data in order to measure performance - similar to a test set, but different.
+  * The other 90% is used to fit the model.
+  * The model from the 90% is applied to the 10% and generates predictions - performance metrics are computed based on these predictions
+  * The final estimates for the model are the averages of the performance statistics
+  
+## Fitting with resampling
+This creates the folds for cross-validation
+```{r}
+set.seed(345)
+folds <- vfold_cv(cell_train, v = 10)
+```
+
+What we can do is create a workflow with the RF model and the formula (class ~ .).  And from that, we can use fit_resamples from the tune package to compute a set of performance metrics.
+```{r}
+rf_wf <- 
+  workflow() %>%
+  add_model(rf_mod) %>%
+  add_formula(class ~ .)
+
+set.seed(456)
+rf_fit_rs <- 
+  rf_wf %>% 
+  fit_resamples(folds)
+```
+
+The collect_metrics from the tune package provides a tibble of the
+```{r}
+collect_metrics(rf_fit_rs)
+
+```
+
