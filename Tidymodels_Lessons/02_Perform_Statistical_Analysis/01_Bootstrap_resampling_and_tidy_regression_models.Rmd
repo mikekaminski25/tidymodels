@@ -4,27 +4,123 @@ author: "Mike Kaminski"
 date: "2023-08-21"
 output: html_document
 ---
-
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, warning = FALSE,
+                      message = FALSE, dpi = 180)
 ```
 
-## R Markdown
+# Intro
+combining fitted models in a tidy way is useful for performing bootstrapping or permutation tests.  Bootstrapping consists of randomly sampling a data set with replacement, then performing the analysis individually on each bootstrapped replicate.  The variation in the resulting estimate is a reasonable approximation of the variance in our estimate.
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
+```{r}
+library(tidymodels)
 ```
 
-## Including Plots
+For example, let's say we want to fit a nonlinear model to the weight/mileage relationship in the mtcards dataset.
+```{r}
+ggplot(mtcars, aes(mpg, wt)) + 
+    geom_point()
 
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+Non-linear least squares
+```{r}
+nlsfit <- nls(mpg ~ k / wt + b, mtcars, start = list(k = 1, b = 0))
+summary(nlsfit)
+
+```
+
+```{r}
+ggplot(mtcars, aes(wt, mpg)) +
+    geom_point() +
+    geom_line(aes(y = predict(nlsfit)))
+```
+While this provides a p-value and confidence intervals for the parameters, these are based on model assumptions that may not gold in real data.  Bootstrapping provides confidence intervals and predictions that are more robust to the nature of the data.
+
+# Bootstrapping Models
+The bootstraps() function is in rsample and can be used to sample bootstrap replications.  The below code creates 2000 bootstrap replicates, each being randomly sampled with replacement.  The object created from this is an rset object, which is a dataframe with a column of rsplit objects.
+
+The rsplit object has two main components: an analysis data set and an assessment data set.  The analysis data set is the bootstrap sample itself, while the assessment data set is all the out-of-bag samples.
+```{r}
+set.seed(27)
+boots <- bootstraps(mtcars, times = 2000, apparent = TRUE)
+head(boots$splits,5)
+```
+
+We can create a helper function to fit an nls() (non-linear least square) model one ach bootstrap sample.  The map() function from purrr is used to apply this function to all the bootstrap samples at once.  The model is created and a column called coef_info is created and unnested.  The boot_coefs contains a summary of the information from each model.
+```{r}
+fit_nls_on_bootstrap <- function(split) {
+    nls(mpg ~ k / wt + b, analysis(split), start = list(k = 1, b = 0))
+}
+
+boot_models <-
+  boots %>% 
+  mutate(model = map(splits, fit_nls_on_bootstrap),
+         coef_info = map(model, tidy))
+
+boot_coefs <- 
+  boot_models %>% 
+  unnest(coef_info)
+
+head(boot_coefs,5)
+```
+
+# Confidence intervals
+We can use the percentile method to calculate the confidence intervals
+```{r}
+percentile_intervals <- int_pctl(boot_models, coef_info)
+percentile_intervals
+```
+
+A histogram could also be created to get a better visualization of the uncertainty in each estimate.
+```{r}
+ggplot(boot_coefs, aes(estimate)) +
+  geom_histogram(bins = 30) +
+  facet_wrap( ~ term, scales = "free") +
+  geom_vline(aes(xintercept = .lower), data = percentile_intervals, col = "blue") +
+  geom_vline(aes(xintercept = .upper), data = percentile_intervals, col = "blue")
+```
+
+There are a few other ways to generate confidence intervals
+  * int_pctl: percentile; these are standard, but need thousands of resamples to be accurate
+  * int_t: t-intervals; these need fewer resamples, but require a variance
+  * int_bca: bias-corrected/accelerated; these need the original function that was used to create the statistic of interest and are computationally taxing
+  
+# Possible Model Fits
+The augment function provides us with a way to visualize the uncertainty in the fitter curve.
+```{r}
+boot_aug <- 
+  boot_models %>% 
+  sample_n(200) %>% 
+  mutate(augmented = map(model, augment)) %>% 
+  unnest(augmented)
+```
+
+```{r}
+ggplot(boot_aug, aes(wt, mpg)) +
+  geom_line(aes(y = .fitted, group = id), alpha = .2, col = "blue") +
+  geom_point()
+```
+
+With only making a few small changes, we can perform bootstrapping with other kinds of predictive or hypothesis testing models - given that tidy() and augment() function work for many statistical outputs.  Smooth.splin() is below
+```{r}
+fit_spline_on_bootstrap <- function(split) {
+    data <- analysis(split)
+    smooth.spline(data$wt, data$mpg, df = 4)
+}
+
+boot_splines <- 
+  boots %>% 
+  sample_n(200) %>% 
+  mutate(spline = map(splits, fit_spline_on_bootstrap),
+         aug_train = map(spline, augment))
+
+splines_aug <- 
+  boot_splines %>% 
+  unnest(aug_train)
+
+ggplot(splines_aug, aes(x, y)) +
+  geom_line(aes(y = .fitted, group = id), alpha = 0.2, col = "blue") +
+  geom_point()
+```
+
