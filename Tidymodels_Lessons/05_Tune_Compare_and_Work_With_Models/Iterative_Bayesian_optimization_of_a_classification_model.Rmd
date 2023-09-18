@@ -11,22 +11,131 @@ knitr::opts_chunk$set(echo = TRUE, cache = TRUE, warning = FALSE,
                       fig.width = 10, fig.height = 5)
 ```
 
-## R Markdown
+# Introduction
+This workbook will focus on using grid search for tuning the model.  Iterative search is another method that can be used to analyze exisiting tuning parameter results and then predict which tuning parameters to try next.
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
+The data that we'll use is the cell segmenting data, which has been used a few other workbooks.
+```{r}
+library(tidymodels)
+library(modeldata)
+library(kernlab)
+library(themis)
 ```
 
-## Including Plots
+```{r}
+# Load data
+data(cells)
 
-You can also embed plots, for example:
+set.seed(1234)
+tr_te_split <- initial_split(cells %>% select(-case), prop = 3/4)
+cell_train <- training(tr_te_split)
+cell_test  <- testing(tr_te_split)
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+set.seed(1987)
+folds <- vfold_cv(cell_train, v = 10)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+# The Tuning Scheme
+The predictors in this data set are highly correlated, so we can use a recipe to convert the original predictors to principal component scores.  There is a slight imbalance in the data set as well - 64% are poorly classified.  To mitigate this, we can down-sample at the end of the pre-processing so that the number of poorly and well segmented cells occur with equal frequency.  We can use the recipe for preprocessing, but the number of PCs will need to be tuned so that we have enough - but not too many - representations of the data
+
+For review:
+* Downsampling: reduces the number of data points in the data set.  It takes the majority class and removes some of their values.  This should only be done on the training dataset.
+* Upsampling: increases the number of data points in the data set.  It takes the minorit class and replicates some of their values. This should only be done on the training
+
+Transformations: <\br>
+Both methods are used to stabilize the variance and make the data more closely follow a normal distribution
+* Box-Cox: assumes the data is strictly positive.  Good for data that's right skewed or needs to be more symmetric.  The lambda parameter is estimated from the data by maximizing the log-likelihood function.
+* Yeo-Johnson: This can handle both positive and negative data.  Good for data with a mix of positive and negative skewness.
+```{r}
+cell_pre_proc <-
+  recipe(class ~ ., cell_train) %>%
+  step_YeoJohnson(all_predictors()) %>%
+  step_normalize(all_predictors()) %>%
+  step_pca(all_predictors(), num_comp = tune()) %>%
+  step_downsample(class)
+```
+
+We're going to use SVM for this model using the radial basis function kernel (RBF) and tune the main parameter - sigma.  Additionally, the main SVM parameter - the cost value - needs to be optimized
+```{r}
+svm_mod <-
+  svm_rbf(mode = "classification", cost = tune(), rbf_sigma = tune()) %>%
+  set_engine("kernlab")
+```
+
+The recipe and model will be combined into a single workflow and used in the optimization process
+```{r}
+svm_workflow <-
+  workflow() %>%
+  add_model(svm_mod) %>%
+  add_recipe(cell_pre_proc)
+
+```
+
+From this object, we can derive information about what parameters are slated to be tuned.
+```{r}
+svm_set <- extract_parameter_set_dials(svm_workflow)
+svm_set
+```
+
+The deafult range for the number of PCA components is rather small for the data set.  A member of the parameter set can be modifided using update() function.  We can update the number of components to be between 0 and 20 - with zero meaning that pca will not be used.
+```{r}
+svm_set <- svm_set %>%
+  update(num_comp = num_comp(c(0L,20L)))
+```
+
+# Sequential Tuning
+Bayesian Optimization is a sequential method that uses a model to predict new candidate parameters for assessment.  When scoring the potential values, the mean and variance of performance are predicted.  The strategy used to define how these two quantities are used is defined by an acquisition function.
+
+One approach for scoring new candidates is to use a confidence bound.  Suppose accuracy is being optimized.  For a metric we want to maximize, a lower confidence bound can be used.  The multiplier on the standard error - k - is a value that can be used to make trade-offs between exploration and exploitation.</br>
+* Exploration: means that the search will consider candidates in untested space
+* Exploitation: focuses in areas where the previous best results occured.
+
+The variance predicted by the Bayesian model is mostly spatial variation; the value will be large for candidate values that are not close to values that have already been evaluated.  If the standard error multiplier is higher is high, the serach process will be more likely to avoid areas without candidate values in the vicinity.
+
+We'll use another acquisition function - expected improvement - that determines which candidates are likely to be helpful relative to the current best results.  This is the default acquisition function.
+```{r}
+set.seed(123)
+search_res <-
+  svm_workflow %>% 
+  tune_bayes(
+    resamples = folds,
+    # To use non-default parameter ranges
+    param_info = svm_set,
+    # Generate five at semi-random to start
+    initial = 5,
+    iter = 50,
+    # How to measure performance?
+    metrics = metric_set(roc_auc),
+    control = control_bayes(no_improve = 30, verbose = TRUE)
+  )
+
+
+```
+
+The best performance of the initial set of candidate variables was an AUC = 0.8762077
+```{r}
+estimates <- 
+  collect_metrics(search_res) %>% 
+  arrange(.iter)
+
+estimates
+
+```
+
+The best results were achieved on iteration 4 with anA UC of 0.8894802.  The top 5 results are included below.
+```{r}
+show_best(search_res, metric = "roc_auc")
+```
+
+A plot can be created.  There are many parameter combinations that have roughly equivalent values
+```{r}
+autoplot(search_res, type = "performance")
+
+```
+
+This shows how the parameters changed over time
+```{r}
+autoplot(search_res, type = "parameters") + 
+  labs(x = "Iterations", y = NULL)
+```
+
