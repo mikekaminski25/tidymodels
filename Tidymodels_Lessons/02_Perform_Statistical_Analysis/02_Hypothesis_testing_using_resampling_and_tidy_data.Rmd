@@ -6,25 +6,191 @@ output: html_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, warning = FALSE,
+                      message = FALSE, dpi = 180)
 ```
 
-## R Markdown
+# Intro
+Within tidymodels, there's a package called infer, which implements an expressive grammar to perform statistical inference that coheres with the tidyverse framework.  Rather than prviding specific methods for statistical tests, the package consolidates the principles that are shared among common hypothesis tests into a set of 4 main verbs/functions.
+  * specify: allows you to specify the variable or relationship between variables that you're interested in
+  * hypothesize: allows you to declare the null
+  * generate: allows you to generate data reflecting the null hypothesis
+  * calculate: allows you to calculate a distribution of statistics from the generated data to form the null distribution
+  
+For this example, we'll use the gss data set.  Each row is a survey response containing some demographic information on the respondent as well as some other variables.
+```{r}
+library(tidymodels) # Includes the infer package
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+# load in the data set
+data(gss)
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+# take a look at its structure
+dplyr::glimpse(gss)
+```
+The specify function allows us to specify the variables that we're interested in.  Specify doesn't just show us the column in the df.  There are specific classes within the object.
+```{r}
+gss %>%
+  specify(response = age)
 
-```{r cars}
-summary(cars)
+gss %>%
+  specify(response = age) %>%
+  class()
+```
+If we were interested in two variables, we can use specify to show their relationship in two different ways.
+```{r}
+gss %>%
+  specify(age ~ partyid)
+
+gss %>%
+  specify(response = age, explanatory = partyid)
 ```
 
-## Including Plots
-
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
+The success argument can be used if we're doing inference on one proportion or a difference in proportions. If we want the proportion of the population with a college degree, then we could use the below. 
+```{r}
+gss %>%
+  specify(response = college, success = "degree")
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+# Declare the Hypothesis
+The next step in the infer pipeline is to declare the null hypothesis.  The null can be "independence" or "point".  If independence is assumed between the two variables, then we use independence.  If an inference point estimate is being done, we'll need to provide either p (the proportion of successes between 0 and 1), mu (the true mean), med (median), or sigma (standard deviation).  THe mean number of hours worked is below.
+```{r}
+gss %>%
+  specify(college ~ partyid, success = "degree") %>%
+  hypothesize(null = "independence")
+
+gss %>%
+  specify(response = hours) %>%
+  hypothesize(null = "point", mu = 40)
+```
+
+# Generate the distribution
+Once we have the null hypothesis using hypothesize, we can construct a null distribution based on the hypothesis.  We can use several methods, supplied in the type argument
+  * bootstrap: a bootstrap sample will be drawn for each replicate, where a sample of size equal to the input sample size is drawn with replacement from the input sample data.
+  * permute: For each replicate, each input value will be randomly reassigned without replacement to a new output value in the sample
+  * simulate: a value will be sampled from a theoretical distribution with parameters specified within hypothesize for each replicate (only available for testing point estimates.)
+
+Average number of hours worked a week
+```{r}
+gss %>%
+  specify(response = hours) %>%
+  hypothesize(null = "point", mu = 40) %>%
+  generate(reps = 5000, type = "bootstrap")
+```
+In the above, we take 5000 bootstrap samples to form the null distribution.
+
+To generate a null distribution for the independence of two variables, we could also randomly reshuffle the pairings of explanatory and response variables to break any existing association.  For example, let's say we want to generate 5000 replicates that can be used to create a null distribution under the assumption that politcal party affiliation is not affected by age.
+```{r}
+gss %>%
+  specify(partyid ~ age) %>%
+  hypothesize(null = "independence") %>%
+  generate(reps = 5000, type = "permute")
+```
+
+# Calculate Statistics
+Depending on whether we're carrying out computation-based inference or theory based inference, we'll need to supply calculate() with the of generate() or hypothesize() respectively.  The functions takes a stat argument ("mean", "median", "sum", "sd", "prop", "count", "diff in means", "diff in medians", "diff in props", "Chisq", "F", "t", "z", "slope", or "correlation").
+
+The below calculates the null distribution of mean hours worked per week:
+```{r}
+gss %>%
+  specify(response = hours) %>%
+  hypothesize(null = "point", mu = 40) %>%
+  generate(reps = 5000, type = "bootstrap") %>%
+  calculate(stat = "mean")
+```
+This shows us the sample statistic - mean - for each of the 1000 replicates.  If we're doing diff in means, medians, or proportions, or t and z stats, we'll need to supply an order arguement, which gives the order in which the explanatory variables should be subtracted.
+
+For example, if we want to find the difference in mean age of those with and without a college degree, then:
+```{r}
+gss %>%
+  specify(age ~ college) %>%
+  hypothesize(null = "independence") %>%
+  generate(reps = 5000, type = "permute") %>%
+  calculate("diff in means", order = c("degree", "no degree"))
+```
+
+# Other Utilities
+the infer package offers several utilities to extract meaning out of the summary statistics and null distributions.  There are functions to visualize where a statistic is relative to a distribution, calculate p-values, and calculate confidence intervals.
+
+The below determines whether the mean number of hours worked per week is 40 hours
+```{r}
+# find the point estimate
+point_estimate <- gss %>%
+  specify(response = hours) %>%
+  calculate(stat = "mean")
+
+# generate a null distribution
+null_dist <- gss %>%
+  specify(response = hours) %>%
+  hypothesize(null = "point", mu = 40) %>%
+  generate(reps = 5000, type = "bootstrap") %>%
+  calculate(stat = "mean")
+```
+
+Our point estimate is 41.4, which is fairly close to 40, but different.  is this difference due to random chance or is the mean number of hours worked per week different than 40?
+
+```{r}
+null_dist %>%
+  visualize()
+```
+Where does our point estimate sit on the distribution?  Obs_stat can be used to show this
+```{r}
+null_dist %>%
+  visualize() +
+  shade_p_value(obs_stat = point_estimate, direction = "two_sided")
+```
+The plot has shaded the regions of the null distribution that are as - or more - extreme than our observed statistic.
+
+The red line is awfully close to the shaded region of the null distribution, so observing a sample mean of 41.4 hours would be somewhat unlikely, but how unlikely?
+```{r}
+# get a two-tailed p-value
+p_value <- null_dist %>%
+  get_p_value(obs_stat = point_estimate, direction = "two_sided")
+
+p_value
+```
+The p-value is 0.0384, which is fairly small.  If the true mean number of hours worked per week was actually 40, the probability that our sample being this far from 40 would be 0.0384 - which is significant at the 0.05 level, but not 0.01.
+
+We can geta  confidence interval
+```{r}
+# start with the null distribution
+null_dist %>%
+  # calculate the confidence interval around the point estimate
+  get_confidence_interval(point_estimate = point_estimate,
+                          # at the 95% confidence level
+                          level = .95,
+                          # using the standard error
+                          type = "se")
+```
+40 is not included in the confidence interval, which aligns with our previous conclusion that htis finding is significant at the CI level of 0.05.
+
+# Theoretical Methods
+We can also do chisq, F and t test statistics.
+
+Generally to find a null distribution using theory-based methods, we'd use the same code, but skip the generate() step.  For example, if we wanted to find a null distribution for the relationship between age and partyid:
+```{r}
+null_f_distn_theoretical <- gss %>%
+   specify(age ~ partyid) %>%
+   hypothesize(null = "independence") %>%
+   calculate(stat = "F")
+
+```
+
+We'll calculate the observed statistic to make use of in the visualization.
+```{r}
+F_hat <- gss %>% 
+  specify(age ~ partyid) %>%
+  calculate(stat = "F")
+```
+
+We need to provide a method in the visualize function,
+```{r}
+visualize(null_f_distn_theoretical, method = "theoretical") +
+  shade_p_value(obs_stat = F_hat, direction = "greater")
+```
+
+To get a sence of how the theory-based and randomization-based null distribution relate, we can pipe the randomization-based null distribution specifying the method "both"
+```{r}
+visualize(null_f_distn, method = "both") +
+  shade_p_value(obs_stat = F_hat, direction = "greater")
+```
+
