@@ -1,0 +1,151 @@
+---
+title: "Nested resampling"
+author: "Mike Kaminski"
+date: "2023-09-18"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, warning = FALSE,
+                      message = FALSE, dpi = 180,
+                      fig.width = 10, fig.height = 5)
+```
+
+# Introduction
+This workbook introduces nested resampling.  It's more computationally taxing and challenging than other methods, but it has the potential to produce better estimates of model performance.
+
+# Resampling Models
+Generally an initial split is created for a model.  From there, resmapling is done on the training set.  A series of binary splits is created.  The term analysis set is the data used to fit the model, while assessment set is used to compute performance. Grid search is generally a good way of tuning the parameters.  Each time, the assessment data is uaed to measure performance and the average value is determined for each tuning parameter
+
+The problem here is that once we pick the tuning parameter associated with best performance, this performance value is usually quoted as the performance of the model.  This has potential for optimization bias since we use the same data to tune the model and assess performance.
+
+Nested resampling uses an additional layer of resampling that separates the tuniing activities from the process used to estimate the efficacy of the model.  An outer resmapling scheme is used, and for every split in the oyter resample, another full set of resmapling splits are created on the original analysis set.  For example, if 10-fold cross-validation is used on the outside and 5-fold cross-validation on the inside, a total of 500 models will be fit. THe parameter tuning will be conducted 10 times and the best paramters are determined from the average of the 5 assessment sets.  The process occurs 10 times.
+
+Once the tuning results are complete, a model is fit to each of the outer resmpling splits using the best paramter assocaited with that resample.  The average of the outer method's assessment sets are an unbiased estimate of the model.
+
+We will simulate some regression data to illustrate the methods.  The mlbench package has a function that can simutalte complex regression data structure.  A training set of 100 data points are generated as well as a large set that will be used to characterize how well the resampling procedure peformed
+
+```{r}
+library(furrr)
+library(kernlab)
+library(mlbench)
+library(scales)
+library(tidymodels)
+```
+
+
+```{r}
+sim_data <- function(n) {
+  tmp <- mlbench.friedman1(n, sd = 1)
+  tmp <- cbind(tmp$x, tmp$y)
+  tmp <- as.data.frame(tmp)
+  names(tmp)[ncol(tmp)] <- "y"
+  tmp
+}
+
+set.seed(9815)
+train_dat <- sim_data(100)
+large_dat <- sim_data(10^5)
+
+```
+
+# Nested Resampling
+To get started, the type of resampling needs to be specified.  Since the data is small, 5 repeats of 10-fold cv will be used as outer resampling for generating the estimate of overall performance.  To tune the model, it would advantageous to have precise estimates for each of the values of the tuning parameter - so we'll use 25 iterations of bootstrap.
+```{r}
+results <- nested_cv(train_dat,
+                     outside = vfold_cv(repeats = 5),
+                     inside = bootstraps(times = 25))
+```
+
+The splitting info for each resample is contained in the split objects.  Here is the second fold of the first repeat.
+```{r}
+results$splits[[2]]
+```
+
+Each element of inner_resample has its own tibble with the bootstrapping splits.  These are self-contained, meaning that the bootstrap sample is aware that it is a sample of a specific 90% of the data.
+```{r}
+results$inner_resamples[[5]]$splits[[7]]
+```
+
+To start, we need to define how the model will be created and measured.  We'll use radial basis support vector machine model via the function ksvm.  This model is generally consdiered to have two parameters: the SVM cost and sigma.  Only the cost value will be tuned and the function sigest will be used to estimate sigma during each model fit.  This will automatically be done by ksvm.
+
+After the model is fit to the analysis set, the RMSE is computed on the assessment set.  For this model, it is critical to center and scale the predictors before computing do products.  We don't do the operation here because the mlbench:friedman1 simulates all of the predictors to be standardized uniform random variables.
+
+The function to fit the model and compute the RMSE is used below.
+```{r}
+# `object` will be an `rsplit` object from our `results` tibble
+# `cost` is the tuning parameter
+svm_rmse <- function(object, cost = 1) {
+  y_col <- ncol(object$data)
+  mod <- 
+    svm_rbf(mode = "regression", cost = cost) %>% 
+    set_engine("kernlab") %>% 
+    fit(y ~ ., data = analysis(object))
+  
+  holdout_pred <- 
+    predict(mod, assessment(object) %>% dplyr::select(-y)) %>% 
+    bind_cols(assessment(object) %>% dplyr::select(y))
+  rmse(holdout_pred, truth = y, estimate = .pred)$.estimate
+}
+
+# In some case, we want to parameterize the function over the tuning parameter:
+rmse_wrapper <- function(cost, object) svm_rmse(object, cost)
+```
+
+For the nested resmapling, a model needs to be fit for each tuning parameter and each bootstrap to split.  This creates a wrapper
+```{r}
+# `object` will be an `rsplit` object for the bootstrap samples
+tune_over_cost <- function(object) {
+  tibble(cost = 2 ^ seq(-2, 8, by = 1)) %>% 
+    mutate(RMSE = map_dbl(cost, rmse_wrapper, object = object))
+}
+```
+
+Since this will be called across the set of outer cross-validation splits, another wrapper is required
+```{r}
+# `object` is an `rsplit` object in `results$inner_resamples` 
+summarize_tune_results <- function(object) {
+  # Return row-bound tibble that has the 25 bootstrap results
+  map_df(object$splits, tune_over_cost) %>%
+    # For each value of the tuning parameter, compute the 
+    # average RMSE which is the inner bootstrap estimate. 
+    group_by(cost) %>%
+    summarize(mean_RMSE = mean(RMSE, na.rm = TRUE),
+              n = length(RMSE),
+              .groups = "drop")
+}
+```
+
+Now that tuning results are defined, we can execute inner resampling
+```{r}
+tuning_results <- map(results$inner_resamples, summarize_tune_results) 
+```
+
+Alternatively, since these computations can be run in parallel, we can use the furr package.  Instead of using map(), the function future_map() parallelizes the iterations using the future package.  The multisession plan uses the local cores to process the nner resampling loop.  The end results are the same as the sequential computations
+
+```{r}
+plan(multisession)
+
+tuning_results <- future_map(results$inner_resamples, summarize_tune_results) 
+```
+This object contrains a list of data frames for each of the 50 outer resamples
+
+This is a plot of the averaged results tthat shows the relationship between the RMSE and the tuninf parameters for each of the inner bootstrapping observations.
+```{r}
+pooled_inner <- tuning_results %>% bind_rows
+
+best_cost <- function(dat) dat[which.min(dat$mean_RMSE),]
+
+p <- 
+  ggplot(pooled_inner, aes(x = cost, y = mean_RMSE)) + 
+  scale_x_continuous(trans = 'log2') +
+  xlab("SVM Cost") + ylab("Inner RMSE")
+
+for (i in 1:length(tuning_results))
+  p <- p  +
+  geom_line(data = tuning_results[[i]], alpha = .2) +
+  geom_point(data = best_cost(tuning_results[[i]]), pch = 16, alpha = 3/4)
+
+p <- p + geom_smooth(data = pooled_inner, se = FALSE)
+p
+```
+
