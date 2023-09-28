@@ -1,0 +1,196 @@
+---
+title: "An introduction to calibration with tidymodels"
+author: "Mike Kaminski"
+date: "2023-08-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, warning = FALSE,
+                      message = FALSE, dpi = 180)
+```
+
+# Introduction
+This workbook uses the probably package can improve classification and regression models.
+
+There are essentially three different parts to this model:
+  * The pre-processing stage (feature engineering, normalization, etc.)
+  * model fitting (training the model)
+  * post-processing (optimizing the probability threshold)
+  
+I'll explore the post-processing tool called 'model calibration'.  After the model is fit, there may be a way to improce the model by altering the predicted values.
+
+```{r}
+library(tidymodels)
+library(probably)
+library(discrim)
+library(betacal)
+
+tidymodels_prefer()
+theme_set(theme_bw())
+options(pillar.advice = FALSE, pillar.min_title_chars = Inf)
+```
+
+# Predicting Cell Segmentation Quality
+This data is from the modeldata package.  It shows gow to create models that predict the quality of the image analysis of cells.  THe outcome has two levels PS and WS - poorly and well segmented.  There are 56 features that can be used to build a classifier
+```{r}
+data(cells)
+cells$case <- NULL #removes an unwatned column
+
+dim(cells)
+
+cells %>% count(class)
+
+```
+
+There's a class imbalance, but that's not going to impact what we do.  We'll split the data and create a set with 10-fold cross-validation for resampling
+```{r}
+set.seed(123)
+split <- initial_split(cells, strata = class)
+cells_tr <- training(split)
+cells_te <- testing(split)
+
+cells_rs <- vfold_cv(cells_tr, strata = class)
+```
+
+## A Naive Bayes Model
+In order to showcase the utility of the calibration tools, we'll chose a model that is likely to produce poorly calibrated results.  The Naive Bayes classifier is a well-established model that assumes predictors are statistically independent of each other.  That is certainly not the case for these, however the model can still be effective at discriminating between the classes.  Unfortunately, when there are many predictors in the model, it has a tendency to produce class probabilty distributions that are pathological.  The predictions tend to gravitate to values near zero or one, producing distrbutions that are u-shaped.
+```{r}
+
+bayes_wflow <-
+  workflow() %>%
+  add_formula(class ~.) %>%
+  add_model(naive_Bayes())
+
+```
+
+We can resample the model first so that we can get a good assessment of the results.  There are two metrics used to judge how well the model worked:
+* area under the ROC curve measures the ability of the model to separate the classes using probability predictions
+* The Brier score can measure how close the probability estimates are to the actual outcome values - zero or one
+```{r}
+cls_met <- metric_set(roc_auc, brier_class)
+
+# Saves the out of sample predictions for visualizations
+ctrl <- control_resamples(save_pred = TRUE)
+
+bayes_res <-
+  bayes_wflow %>%
+  fit_resamples(cells_rs, metrics = cls_met, control = ctrl)
+
+collect_metrics(bayes_res)
+```
+The ROC score is solid, however the Brier value indicates that the probability values, while discriminating well, are not very realistic.  A value of 0.25 is a bad mode threshold when there are two classes.
+
+
+## Is It Calibrated?....No
+
+The  first clue is the u-shaoed distribution of the probability scores. 
+```{r}
+collect_predictions(bayes_res) %>%
+  ggplot(aes(.pred_PS)) +
+  geom_histogram(col = "white", bins = 40) +
+  facet_wrap(~ class, ncol = 1) +
+  geom_rug(col = "blue", alpha = 1 / 2) + 
+  labs(x = "Probability Estimate of PS")
+  
+```
+There are almost no cells with moderate probability.  Also, when the model is incorrect, it is confidently incorrect.  The probably package has tools for visualizing and correcting models with poor calibration properties.
+
+The most common plot is to break the predictions into about ten equally sized buckets and compute the actual event rate within each.  For example, if a bin captures the samples predicted to be poorly segmented with probabilities between 20% and 30%, we should expect about a 25% event rate (aka the bin midpoint) within that partition.
+```{r}
+cal_plot_breaks(bayes_res)
+```
+These probabilities are not showing good accuracy.  There is also a similar function that can use moving windows with overlapping partitions that gives a little more detail
+cal_plot_windowed(bayes_res, step_size = 0.025)
+```{r}
+cal_plot_windowed(bayes_res, step_size = 0.025)
+```
+Still bad
+
+For two class outcomes, we can fit a logistic generalized additive model (GAM) and examine the trend
+```{r}
+cal_plot_logistic(bayes_res)
+```
+still very bad
+
+## Remediation
+There are tools to fix the probability estimates so that they have better properties, such as falling along the diagonal lines in the diagnostic plots.  Different methods improve the predictions in different ways.
+
+The most common approach is to fit a logistic regression model to the data - with the probability estimates as the predictor.  The probability predictions from this model are then used as the calibrated estimate.  By default, a generalized additive model is used for this fit, but the smooth = FALSE argument can use simple linear effects.
+
+The GAM model estimates the probability regions where the model is off - as shown in the diagnostic plot.  Suppose that when the model predicts a 2% event rate, the GAM model estimates that it under-predicts the probability by 5% - relative to the observed data.  Given this gap, new predictions are adjusted up so that the probability estimates are more in-line with the data
+
+We know this works because there is a set of cal_validate_*() functions that can use holdout data to resample the model with and without the calibration tool of choice.  Since we've already resampled the model, we'll use those results to estimate 10 more logistic regressions and use the out-of-sample data to estimate performance.
+
+```{r}
+logit_val <- cal_validate_logistic(bayes_res, metrics = cls_met, save_pred = TRUE)
+collect_metrics(logit_val)
+
+collect_predictions(logit_val) %>%
+  filter(.type == "calibrated") %>%
+  cal_plot_windowed(truth = class, estimate = .pred_PS, step_size = 0.025) +
+  ggtitle("Logistic calibration via GAM")
+```
+This is a lot better but it's problematic that the calibrated predictions do not reach zero or one.
+
+A different approach is to use isotonic regressions.  The method can result in very few unique probability estimates.  The probably package has a version of isotonic regression that resamples the process to produce more unique probabilties.
+```{r}
+set.seed(1212)
+iso_val <- cal_validate_isotonic_boot(bayes_res, metrics = cls_met, 
+                                      save_pred = TRUE, times = 25)
+collect_metrics(iso_val)
+
+collect_predictions(iso_val) %>%
+  filter(.type == "calibrated") %>%
+  cal_plot_windowed(truth = class, estimate = .pred_PS, step_size = 0.025) +
+  ggtitle("Isotonic regression calibration")
+```
+THis is a lot better, but there is a slight bias since the setimated points are consistently above the identity line on the 45-degree angle.
+
+We can test out a beta calibration
+```{r}
+beta_val <- cal_validate_beta(bayes_res, metrics = cls_met, save_pred = TRUE)
+collect_metrics(beta_val)
+
+collect_predictions(beta_val) %>%
+  filter(.type == "calibrated") %>%
+  cal_plot_windowed(truth = class, estimate = .pred_PS, step_size = 0.025) +
+  ggtitle("Beta calibration")
+
+```
+It's an improvement, but it does poorly at the lower end of the sacle.
+
+Beta calibration appears to have the best results.  We'll save a model that is trained using all of the out-of-sample predictions from the original Bayes resampling results.
+
+We can also fit the final naives Bayes model to predict the test set
+```{r}
+cell_cal <- cal_estimate_beta(bayes_res)
+bayes_fit <- bayes_wflow %>% fit(data = cells_tr)
+```
+
+## Test Set Results
+First we'll make ordinary predictions
+```{r}
+cell_test_pred <- augment(bayes_fit, new_data = cells_te)
+cell_test_pred %>% cls_met(class, .pred_PS)
+```
+These metrics are consistent with the resampled performance estimates.
+
+The cell_cal object can be used with the cal_apply() function
+```{r}
+cell_test_cal_pred <-
+  cell_test_pred %>%
+  cal_apply(cell_cal)
+cell_test_cal_pred %>% dplyr::select(class, starts_with(".pred_"))
+```
+
+The cal_apply() recomputed the hard class predictions in the .pred_class column. It's possible that the changes in the probabilty estimates could invalidate the oringal hard class estimates.
+
+What do the calibrated test results show?
+```{r}
+cell_test_cal_pred %>% cls_met(class, .pred_PS)
+
+cell_test_cal_pred %>%
+  cal_plot_windowed(truth = class, estimate = .pred_PS, step_size = 0.025)
+```
+This is a lot better and the test set results also agree with the results from cal_validate_beta()
