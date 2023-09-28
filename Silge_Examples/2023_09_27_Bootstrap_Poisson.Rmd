@@ -1,0 +1,71 @@
+---
+title: "Bootstrap confidence intervals for how often Roy Kent says “F*CK”"
+author: "Mike Kaminski"
+date: "2023-09-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, warning = FALSE,
+                      message = FALSE, dpi = 180)
+```
+
+```{r}
+library(tidyverse)
+# library(richmondway)
+
+richmondway <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2023/2023-09-26/richmondway.csv')
+
+data(richmondway)
+glimpse(richmondway)
+```
+```{r}
+richmondway |>
+  ggplot(aes(F_count_RK, fill = Dating_flag)) +
+  geom_histogram(postion = "identity",bins = 7, alpha = 0.7) +
+  scale_fill_brewer(palette = "Dark2")
+```
+
+```{r}
+richmondway |>
+  ggplot(aes(F_count_RK, fill = Coaching_flag)) +
+  geom_histogram(postion = "identity",bins = 7, alpha = 0.7) +
+  scale_fill_brewer(palette = "Dark2")
+```
+
+## Boostrap resampling for Poisson regression 
+
+- Poisson regression - it's a good fit for count data
+- We're not going to fit one time, we're going to fit it 1000 times to bootstrap resamples to this 34 row data set.  We'll get 1,000 fits at the end.  It will give us 1,000 different estimates at the end.  It will give us a better understanding of how strong of evidence we have for an effect.
+
+```{r}
+library(rsample)
+
+set.seed(123)
+poisson_intervals <- reg_intervals(
+  F_count_RK ~ Dating_flag + Coaching_flag,
+  data = richmondway,
+  model_fn = "glm",
+  family = "poisson",
+  keep_reps = TRUE
+  
+)
+poisson_intervals
+```
+With the coaching flag, we do see evidence of more counts, but not with the dating flag
+
+```{r}
+poisson_intervals |>
+  mutate(term = str_remove(term, "_flagYes")) |>
+  unnest(.replicates) |>
+  ggplot(aes(estimate, fill = term)) +
+  geom_histogram(alpha = 0.8, show.legend = FALSE) +
+  geom_vline(xintercept = 0, linewidth = 1.5, lty =2 , color = "gray50") +
+  facet_wrap(vars(term)) +
+  scale_fill_brewer(palette = "Accent") 
+
+
+# this unnests all the estiamtes.  For this term, what's the estimate, what's the estimate
+
+```
+The 1000 replicates we have for coaching, all are above 0.  We have strong evidence that the counts are higher in the episodes where Roy Kent is coaching.  With dating, it's kind of centered around 0.  We don't have evidence that the counts are different in the episodes where Roy and Keeley are dating
