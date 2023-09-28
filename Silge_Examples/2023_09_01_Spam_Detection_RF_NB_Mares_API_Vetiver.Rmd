@@ -1,0 +1,207 @@
+---
+title: "Evaluate multiple ML approaches for spam detection"
+author: "Mike Kaminski"
+date: "2023-09-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, warning = FALSE,
+                      message = FALSE, dpi = 180)
+```
+
+```{r}
+library(tidyverse)
+spam <- read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2023/2023-08-15/spam.csv')
+glimpse(spam)
+```
+```{r}
+spam |>
+  ggplot(aes(crl.tot, fill = yesno)) +
+  geom_density(alpha = 0.5)+
+  scale_x_log10()
+
+
+```
+```{r}
+spam |>
+  pivot_longer(dollar:make) |>
+  mutate(
+    value = value > 0,
+    value = if_else(value, "Greater", "Zero"),
+    yesno = ifelse(yesno == "n","not spam","spam") 
+    )|>
+  ggplot(aes(value, fill = yesno)) +
+  geom_bar() +
+  facet_wrap(vars(name))
+    
+
+
+```
+
+# Build Models
+```{r}
+library(tidymodels)
+
+set.seed(123)
+spam_split <- spam |>
+  mutate(yesno = as.factor(yesno)) |>
+  initial_split(strata = yesno)
+
+spam_train <- training(spam_split)
+spam_test <- testing(spam_split)
+
+set.seed(1244)
+spam_folds <- vfold_cv(spam_train, strata = yesno)
+spam_folds
+```
+Lots of feature engineering has already been done
+
+```{r}
+library(discrim)
+
+# naive bayes calssifeirs were used initially in the 90s - only does classification
+nb_spec <- naive_Bayes()
+nb_spec_tune <- naive_Bayes(smoothness =tune())
+
+#
+mars_spec <- mars() |> set_mode("classification")
+mars_spec_tune <- mars(num_terms = tune()) |> set_mode("classification")
+
+#
+rf_spec <- rand_forest(trees = 1e3) |> set_mode("classification")
+rf_spec_tune <- rand_forest(trees = 1e3, mtry = tune(), min_n = tune()) |> set_mode("classification")
+
+```
+
+```{r}
+spam_models <- workflow_set(
+  preproc = list(formula = yesno ~ .),
+  models = list(
+    nb = nb_spec,
+    mars = mars_spec,
+    rf = rf_spec,
+    nb_tune = nb_spec_tune,
+    mars_tune = mars_spec_tune,
+    rf_tune = rf_spec_tune
+  )
+)
+
+spam_models
+```
+
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(54765)
+spam_res <- 
+  spam_models |>
+  workflow_map(
+    resamples = spam_folds,
+    metrics = metric_set(accuracy, sensitivity, specificity)
+  )
+```
+This is where a whole bunch of model training is going on.  There are 6 models, 3 are tunable.  15x3 + 3.  Training 50 models each 10 times - crossfolds.
+
+```{r}
+autoplot(spam_res)
+```
+The sensitivity for all the models is better than the specificity.  SO it's easier to recognize one class than the other.  The positive cals is probably n.  It's easier to recognize not spam than spam.
+
+The models are not equal when it comes to how much difference is there.  NB does the best on not spam, but the worst on spam.  RF does the best.  It has good specificity and good sensitivity.  Accuracy is good as well.
+
+We can understand differences on how the models perform across the two classes.
+
+```{r}
+rank_results(spam_res, rank_metric = "sensitivity")
+```
+The untuned rf is the best, but not by much.
+
+Rf is the best.  Just need to make sure it has enough trees.
+
+## Fit final model
+```{r}
+spam_wf <-
+  workflow(
+  yesno ~.,
+  rf_spec |> set_engine("ranger", importance = "impurity")
+)
+
+spam_fit <- last_fit(spam_wf, spam_split)
+
+```
+We're interested in changing the engine args.  We still want ranger, as it trains all the trees, it's going to keep impurity information to help me understand which are the most important features - we'll do variable importance this way.
+
+Last_fit fits one time to the training data, evealuates one time on the testing data because we pass in the split
+
+It's imputing variable importance as it goes along
+
+```{r}
+collect_predictions(spam_fit) |>
+  conf_mat(yesno, .pred_class)
+```
+It's predicting not spam fairly well.  About a third of spam emails are predicted correctly.
+
+```{r}
+collect_predictions(spam_fit) |>
+  roc_curve(yesno, .pred_n) |>
+  autoplot()
+```
+If we put the other models on here, we'd be doing worse.
+
+```{r}
+library(vip)
+extract_workflow(spam_fit) |>
+  extract_fit_parsnip() |>
+  vip()
+```
+
+## Build a deployable model object
+```{r}
+library(vetiver)
+
+v<- extract_workflow(spam_fit) |>
+  vetiver_model("spam-email-rf")
+
+v
+```
+This is not deployed, but it is setting up the API that woudl be deployed.
+
+```{r}
+library(plumber)
+pr() |>
+  vetiver_api(v) |>
+  pr_run()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
