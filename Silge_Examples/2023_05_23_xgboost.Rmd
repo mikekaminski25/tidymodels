@@ -1,0 +1,186 @@
+---
+title: "Use xgboost and effect encodings to model tornadoes"
+author: "Mike Kaminski"
+date: "2023-09-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE,
+                      dpi = 180)
+```
+
+```{r, include=FALSE}
+library(tidyverse)
+library(tidymodels)
+tornadoes <- read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2023/2023-05-16/tornados.csv')
+
+glimpse(tornadoes)
+
+```
+
+We want to predict the magnitude of tornadoes based on tornado characteristics - when and where it occurred
+
+This plot shows the count of magnitude separated out by estimated vs actual - fc of TRUE means it was estimated.
+```{r}
+tornadoes |>
+  ggplot(aes(mag, fill = fc)) +
+  geom_bar(position = position_dodge(preserve = "single")) +
+  scale_y_log10()
+
+
+# not really a continuoes variable
+```
+In theory, we could remove tornadoes with estimated magnitudes, but the larger issue is that the outcome we want to model is kind of like a count/interger - it's a ranked measurement.  There are a ton of zeros, it can't be negative, and it's discrete.
+
+We could be classification with multiple classes, however this isn't the best because the classes are in a sequence and classification metrics can't really tell us how wrong we are.
+
+We could try an ordered outcome model - MASS:polr().  It's definitely a good fit for our outcome, but this kind of model is linear and when we have a large dataset that includes complex interactions, a linear model often leaves a lot of possible model performance on the table.
+
+We could try zero-inflated poisson regression - use the outcome as a count with a lot of extra zeros, but again, it's linear and might not be the best.
+
+We could pretend it's continuous, however many of the predictor variables are going to be correlated with each other.
+
+Given it's a large dataset with highly correlated variables, xgboost might be the best.
+
+Xgboost:
+* it's an ensemble learning method, which involves combining multiple models to make predictions.  
+* It typically uses decision trees and combines predictions of weaker models to create a stronger, more accurate model.  
+* Gradient boosting is an iterative process where decision trees are built sequentially, with each one focusing on the mistakes of the previous tree.  This help correct errors and improve accuracy.  
+* The model has an objective function that measures performance and guides the training process - it's optimized when training error is minimized.
+* XGboost uses lasso and ridge regularization - it penalizes overly complex models and encourages the model to find a balnace between simplicity and accuracy.
+* Parallel Processing:  it can take advantage of parallel processing - meaning that it can train models faster on multi-core CPUs or distributed computing environemnts
+* It provides feature importance - which tells you which input features are most influential
+* Cross-validation - needs to be used to avoid overiftting
+
+
+```{r}
+tornadoes |>
+  group_by(st) |>
+  summarise(mag = mean(mag, na.rm = TRUE), n = n()) |>
+  arrange(-mag)
+```
+There are 53 levels to st - which has high cardinality - where a categorical variable has a large number of distinct categories.  We could make dummy variables.  Or we could use likelihood encoding of effect encoding.  Strong tornadoes cause more injuries and fatalities
+
+```{r}
+tornadoes |>
+  filter(!is.na(mag)) |>
+  mutate(mag = as.factor(mag)) |>
+  ggplot(aes(mag, inj, fill = mag)) +
+  geom_boxplot(alpha = 0.6, show.legend = FALSE) +
+  scale_y_continuous(trans = scales::pseudo_log_trans(base = 10))
+  
+
+```
+## Build a model
+```{r}
+set.seed(645134)
+tornado_split<-
+  tornadoes |>
+  filter(!is.na(mag)) |>
+  filter(fc =="FALSE") |>
+  initial_split(strata = mag)
+
+tornado_train <- training(tornado_split)
+tornado_test <- testing (tornado_split)
+
+set.seed(65413)
+tornado_folds <- vfold_cv(tornado_train, strata = mag)
+```
+
+### feature engineering - use a recipe
+```{r warning = FALSE}
+# library(embed)
+tornado_rec <- 
+  recipe(mag ~ date + st + inj + fat + len +wid, data = tornado_train) |>
+  step_lencode_glm(st, outcome = vars(mag)) |> 
+  step_date(date, features = c("month", "year"), keep_original_cols = FALSE) |>
+  step_dummy(all_nominal_predictors())
+
+tornado_rec
+
+```
+Likelihood encoding:
+* we train a little mini model with only state and magnitude and replace the original categorical variable with a single metric that that measures its effect.  The coefficients from the little model are used to compute this new column.
+* step_lencode_glm: Supervised Factor Conversions into Linear Functions using Likelihood Encodings 
+* for each factor predictor, a generalized linear model is fit to the outcome and the coefficients are returned as the encoding.  These coefficients are on the linear predictor scale, so for factor outcomes, they are in log-odds units.
+
+We don't need to use prep() and bake() for our actual training or tuning, but they are useful for debugging feature engineering recipes.We can look at how it turned out.  For debugging, it can be useful how to handle recipes.  It's prepping the recipe - learning from the training data what transformations need to be formed.  That includes the mini model.  It's baking the data - pulling out the training data.
+
+State has numbers instead of names that were learned from the training data.  It maps from the state to effect of the outcome.  There's no Jan, but we can change to one-hot equals true, but we can put in for tree-based models
+```{r}
+prep(tornado_rec) |> bake(new_data = NULL) |> glimpse()
+```
+Big data with variables that are correlated - inj and fat, len and wid.  When we have this, it's xgboost.  It has a lot of hyperparamters.  There's not way to know.
+
+
+We'll create a tunabel xgboost model specification and put it together with our feature engineering in a workflow.  set_mode is "regress", even given the not quite so continuous utcome variable.
+```{r}
+xgb_spec <-
+  boost_tree(
+    trees = tune(),
+    min_n = tune(),
+    mtry = tune(),
+    learn_rate = 0.01
+  ) |>
+  set_engine("xgboost") |>
+  set_mode("regression")
+
+xgb_wf <- workflow(tornado_rec, xgb_spec)
+  
+```
+The workflow has the preprocessing and the model.  It's tunable right now.  We don't know the values of the parameters.
+
+We'll use a racing method in xgboost.
+* Racing methods are efficient approaches to grid search.  Initially, the function evaluates all tuning parameters on a small initial set of resamples.
+* The performance statistics from these resamples are analyzed to determine which tuning parameters are NOT statistically different from the current best setting.  If a parameter is statistically different, it excluded from further resampling.
+* The next resample is used with the remaining parameter combinations and the statistical analysis is updated.  More candidate parameters may be excluded with each new resample that is processed.
+* This function determines statistical significance using a repeated measures ANOVA model where the performance statistic - RMSE, accuracy, etc. - is the outcome data and the random effect is due to resamples
+* control_race function contents are parameters for the significance cutoff applied to ANOVA results as well as other arguments.
+```{r}
+# library(finetune)
+doParallel::registerDoParallel()
+
+#uses an anova model to see if some hyperparamters are different between models
+set.seed(1235)
+xgb_rs <- 
+  tune_race_anova(
+  xgb_wf,
+  resamples = tornado_folds,
+  grid = 15,
+  control = control_race(verbose_elim = TRUE)
+)
+
+```
+xgboost - we don't really know what they should be, but often some of them are really bad.  We'll use the resamples to try all of the different hyperparameter combinations and see which ones turn out really bad and throw them away.
+
+We're taking the 10 resamples - we picked one set of the hyperparameters and it's trying that with all of the resamples. And then ANOVA is used to decide if any of them are statistically much worse and start throwing those away.  It'll keep going until it figures out which ones are best.  We're not evaluating all 15 hyperparamters on all 10 resamples.  some of the hyperparameters are going to get throw away after running the first part.
+
+```{r}
+collect_metrics(xgb_rs)
+
+plot_race(xgb_rs)
+```
+this is only the metrics from the last one.  R^2 is 0.6, RMSE is 0.6 as well.  It's on the same scale as outcome - which is magnitude - .6 magnitude for the tornado
+
+We tried all, some are super bad so we threw away.
+
+```{r}
+tornado_fit <- 
+  xgb_wf |>
+  finalize_workflow(select_best(xgb_rs,"rmse")) |>
+  last_fit(tornado_split)
+```
+
+```{r}
+collect_metrics(tornado_fit)
+collect_predictions(tornado_fit) |>
+  ggplot(aes(.pred)) +
+  geom_histogram()
+```
+
+
+
+
+
+
