@@ -161,15 +161,20 @@ collect_metrics(xgb_rs)
 
 plot_race(xgb_rs)
 ```
-this is only the metrics from the last one.  R^2 is 0.6, RMSE is 0.6 as well.  It's on the same scale as outcome - which is magnitude - .6 magnitude for the tornado
+The racing metric allowed us to drop the model hyperparameter configurations that weren't performing well..
+
+This is only the metrics from the last one.  R^2 is 0.6, RMSE is 0.6 as well.  It's on the same scale as outcome - which is magnitude - .6 magnitude for the tornado
 
 We tried all, some are super bad so we threw away.
 
+We can use last_fit to fit one final time to the training data and evaluate against the testing data.
 ```{r}
 tornado_fit <- 
   xgb_wf |>
   finalize_workflow(select_best(xgb_rs,"rmse")) |>
   last_fit(tornado_split)
+
+tornado_fit
 ```
 
 ```{r}
@@ -179,8 +184,29 @@ collect_predictions(tornado_fit) |>
   geom_histogram()
 ```
 
+```{r}
+collect_predictions(tornado_fit) |> 
+  mutate(mag = factor(mag)) |> 
+  ggplot(aes(mag, .pred, fill = mag)) +
+  geom_boxplot(alpha = 0.4, show.legend = FALSE)
+```
+We are still predicting too few minor, low-magnitude tornadoes with this model, but the range of predictions is about right.  Other than a lack of zero, the distribution looks pretty good.  The lesson here is that sometimes a powerful model like xgboost that can learn complex interactions from large, rectangular data does quite well, even if there's not a perfect application.
 
+Feature importance
+```{r}
+library(vip)
 
+extract_workflow(tornado_fit) |>
+  extract_fit_parsnip() |>
+  vip(num_features = 10)
+```
 
+# Create a deployable model object
+```{r}
+library(vetiver)
+v <- extract_workflow(tornado_fit) |> 
+  vetiver_model("tornado-xgb")
+v
+```
 
 

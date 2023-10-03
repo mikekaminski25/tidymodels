@@ -1,0 +1,151 @@
+---
+title: "Predict childcare costs in US counties with xgboost and early stopping"
+author: "Mike Kaminski"
+date: "2023-10-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE,
+                      dpi = 180)
+```
+
+```{r}
+library(tidyverse)
+
+childcare_costs <- read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2023/2023-05-09/childcare_costs.csv')
+
+glimpse(childcare_costs)
+```
+There are a ton of variables in the dataset and the data is rectangular, with many being highly correlated.  XGBoost should get us to where we need to go.  We want to estimate mcsa - median weekly price for school age kids in child care.
+
+
+```{r}
+childcare_costs |>
+  ggplot(aes(study_year,mcsa, group = study_year, fill = study_year)) +
+  geom_boxplot(alpha =0.8, show.legend = FALSE) +
+  scale_fill_distiller(palette = "RdPu")
+```
+
+```{r}
+childcare_costs |>
+  ggplot(aes(mhi_2018, mcsa, color = flfpr_20to64)) +
+  geom_point(alpha = 0.4) +
+  scale_x_log10() +
+  scale_fill_viridis_c()
+```
+
+```{r}
+childcare_costs |>
+  select(mcsa,mhi_2018, starts_with("one_race")) |>
+  select(-one_race) |>
+  pivot_longer(starts_with("one_race")) |>
+  ggplot(aes(value, mcsa, color = mhi_2018)) +
+  geom_point(alpha = 0.4) +
+  facet_wrap(vars(name), scales = "free_x") +
+  scale_color_viridis_c()
+```
+When a county has more blacks people, household income is lower and childcare costs are lower.  The opposite is true for white people
+
+
+# Build a Model
+```{r}
+library(tidymodels)
+
+set.seed(54)
+childcare_split <-
+  childcare_costs |>
+  select(-matches("^mc_|^mf")) |>
+  select(-county_fips_code) |>
+  na.omit() |>
+  initial_split(strata = mcsa)
+
+
+childcare_train <- training(childcare_split)
+childcare_test <- testing(childcare_split)
+
+set.seed(56403562)
+childcare_set <- validation_split(childcare_train)
+childcare_set$splits
+```
+No feature engineering, just plugging it in to xgboost.  We're going to use early stopping, so we won't tune the trees
+```{r}
+xgb_spec <-
+  boost_tree(
+    trees = 500,
+    min_n = tune(),
+    mtry = tune(),
+    stop_iter = tune(),
+    learn_rate = 0.01 # set fairly high to make it go faster
+  ) |>
+  set_engine("xgboost", validation = 0.2) |> 
+  set_mode("regression")
+
+xgb_wf <- workflow(mcsa ~., xgb_spec)
+```
+* stop_iter How much data does xgboost need to look at while it's boosting, what data should it look at to decide if it's getting better or if it's time to stop.  
+* set_engine -> validation: the training data is going into the xgboost algo, and internally it's going to hold 20% of it back to decide when it's going to stop the algorithm. 
+* we have training set, a test set, a validation set, and then in this case, the training is going to get divided 80/20 within xgboost
+
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(5690)
+xgb_rs <- tune_grid(xgb_wf, childcare_set, grid = 15) #tune with the validation set.  Only doing one time, whereas cross_validation does multiple time
+xgb_rs
+```
+We have 15 possible model configurations.  We're going to try all of them.  We're going to train on the analysis set and evaluated on the assessment set.  15 models, each of them tuned 1 time.  Inside of xgboost, we're holding 20% back to decide when to stop the boosting algorithm to stop
+
+
+```{r}
+autoplot(xgb_rs)
+```
+On a real project, tune once more.  Set higher values or mtry, lower_values of min_n
+
+```{r}
+show_best(xgb_rs, "rmse")
+```
+High value of mtry, low value of min_n, mid value for stop_iter.  Mean is rmse on our predictions measured on the validation data.  It's around $20.  median price per week for a school age child in a childcare center.  We can predict the cost in a county within a little over $20.
+
+
+```{r}
+childcare_fit <-
+  xgb_wf |>
+  finalize_workflow(select_best(xgb_rs, "rmse")) |>
+  last_fit(childcare_split)
+```
+We're taking the tunable workflow and updating with the show_best values and fitting one last time to the whole training set - inclduing the validations set and the data that was held out internally for early stopping.  Then we will evaluate on the testing set.
+
+```{r}
+collect_metrics(childcare_fit)
+```
+How much of the variation in the price did we end up explaining - rsq
+
+```{r}
+library(vip)
+
+extract_workflow(childcare_fit) |>
+  extract_fit_parsnip() |>
+  vip(num_features = 15, geom = "point")
+```
+What proportion of the county population is asian?  It's the most important predictor in the model.  Next thing is mean household income.  Then women's median earnings - how much do women bring in.  Year, households - urban rural size
+
+
+## Bonus
+need to set up model for deployment
+```{r}
+library(vetiver)
+
+v <-
+  extract_workflow(childcare_fit) |>
+  vetiver_model("childcare-vosts-xgb")
+v
+
+```
+This is a deployable model bundle.  I can version or deploy for when new data comes across.
+
+
+
+
+
+
